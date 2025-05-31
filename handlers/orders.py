@@ -2,12 +2,13 @@ import re
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiomysql import create_pool
-from config import config
 from handlers.order_fsm import OrderFSM
+from services.orders_service import insert_order, get_order_status, update_order_status, get_pending_orders, get_order_details
 
 router = Router()
-ADMIN_USER_IDS = [1038982882]  # Замініть на свій Telegram ID
+ADMIN_USER_IDS = [1038982882]  # Ваш Telegram ID
+
+# ... FSM-хендлери (без змін, окрім використання нових функцій)
 
 @router.message(F.text == "/orders")
 async def start_order(message: types.Message, state: FSMContext):
@@ -48,26 +49,9 @@ async def get_phone_number(message: types.Message, state: FSMContext):
         return await message.answer("❗ Введіть номер у правильному форматі, наприклад: +380XXXXXXXXX")
     await state.update_data(phone_number=phone_number)
     data = await state.get_data()
-
-    async with create_pool(
-        host=config.db_config.host,
-        port=config.db_config.port,
-        user=config.db_config.user,
-        password=config.db_config.password,
-        db=config.db_config.database
-    ) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    INSERT INTO orders (product_name, quantity, customer_name, phone_number, status, user_id)
-                    VALUES (%s, %s, %s, %s, 'pending', %s)
-                """, (data["product_name"], data["quantity"], data["customer_name"], data["phone_number"], message.from_user.id))
-                await conn.commit()
-                await cur.execute("SELECT LAST_INSERT_ID()")
-                order_id = await cur.fetchone()
-
+    order_id = await insert_order(data, message.from_user.id)
     await message.answer(
-        f"✅ Замовлення на товар: {data['product_name']}, Кількість: {data['quantity']} прийнято! Ваше ID замовлення: {order_id[0]}. Ми з вами зв’яжемося."
+        f"✅ Замовлення на товар: {data['product_name']}, Кількість: {data['quantity']} прийнято! Ваше ID замовлення: {order_id}. Ми з вами зв’яжемося."
     )
     await state.clear()
 
@@ -77,19 +61,9 @@ async def check_status(message: types.Message):
     if len(parts) != 2 or not parts[1].isdigit():
         return await message.answer("❗ Формат: /check_status [ID]")
     order_id = parts[1]
-    async with create_pool(
-        host=config.db_config.host,
-        port=config.db_config.port,
-        user=config.db_config.user,
-        password=config.db_config.password,
-        db=config.db_config.database
-    ) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT status FROM orders WHERE order_id = %s", (order_id,))
-                result = await cur.fetchone()
-    if result:
-        await message.answer(f"✅ Статус вашого замовлення з ID {order_id}: {result[0]}.")
+    status = await get_order_status(order_id)
+    if status:
+        await message.answer(f"✅ Статус вашого замовлення з ID {order_id}: {status}.")
     else:
         await message.answer("❗ Замовлення не знайдено.")
 
@@ -104,50 +78,30 @@ def get_status_buttons(order_id):
 @router.callback_query(lambda c: c.data.startswith("confirm_"))
 async def confirm_order(callback_query: types.CallbackQuery):
     order_id = callback_query.data.split("_")[1]
-    await update_order_status(callback_query.bot, order_id, "підтверджено")
+    user_id = await update_order_status(order_id, "підтверджено")
     await callback_query.message.answer(f"✅ Замовлення #{order_id} підтверджено!")
+    if user_id:
+        await callback_query.bot.send_message(
+            chat_id=user_id,
+            text=f"ℹ️ Статус вашого замовлення #{order_id} оновлено на: підтверджено"
+        )
 
 @router.callback_query(lambda c: c.data.startswith("reject_"))
 async def reject_order(callback_query: types.CallbackQuery):
     order_id = callback_query.data.split("_")[1]
-    await update_order_status(callback_query.bot, order_id, "відхилено")
+    user_id = await update_order_status(order_id, "відхилено")
     await callback_query.message.answer(f"❌ Замовлення #{order_id} відхилено!")
-
-async def update_order_status(bot, order_id, status):
-    async with create_pool(
-        host=config.db_config.host,
-        port=config.db_config.port,
-        user=config.db_config.user,
-        password=config.db_config.password,
-        db=config.db_config.database
-    ) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("UPDATE orders SET status = %s WHERE order_id = %s", (status, order_id))
-                await conn.commit()
-                await cur.execute("SELECT user_id FROM orders WHERE order_id = %s", (order_id,))
-                result = await cur.fetchone()
-    if result and result[0]:
-        try:
-            await bot.send_message(chat_id=result[0], text=f"ℹ️ Статус вашого замовлення #{order_id} оновлено на: {status}")
-        except Exception as e:
-            print(f"❗ Помилка надсилання повідомлення: {e}")
+    if user_id:
+        await callback_query.bot.send_message(
+            chat_id=user_id,
+            text=f"ℹ️ Статус вашого замовлення #{order_id} оновлено на: відхилено"
+        )
 
 @router.message(F.text == "/view_orders")
 async def view_orders(message: types.Message):
     if message.from_user.id not in ADMIN_USER_IDS:
         return await message.answer("⛔ У вас немає доступу.")
-    async with create_pool(
-        host=config.db_config.host,
-        port=config.db_config.port,
-        user=config.db_config.user,
-        password=config.db_config.password,
-        db=config.db_config.database
-    ) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT order_id, product_name, status FROM orders WHERE status = 'pending'")
-                orders = await cur.fetchall()
+    orders = await get_pending_orders()
     if orders:
         order_list = "\n".join([f"ID: {o[0]}, Товар: {o[1]}, Статус: {o[2]}" for o in orders])
         await message.answer(f"📝 Замовлення на обробку:\n{order_list}")
@@ -162,17 +116,7 @@ async def manage_single_order(message: types.Message):
     if len(parts) != 2 or not parts[1].isdigit():
         return await message.answer("❗ Формат: /manage_order [ID]")
     order_id = int(parts[1])
-    async with create_pool(
-        host=config.db_config.host,
-        port=config.db_config.port,
-        user=config.db_config.user,
-        password=config.db_config.password,
-        db=config.db_config.database
-    ) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT product_name, quantity, customer_name, phone_number, status FROM orders WHERE order_id = %s", (order_id,))
-                result = await cur.fetchone()
+    result = await get_order_details(order_id)
     if not result:
         return await message.answer("❗ Замовлення не знайдено.")
     product, quantity, name, phone, status = result
